@@ -100,11 +100,14 @@ fn run_guest_inner(
 
     let exit_code = program.process.wait_for_unix_shell_exit_code();
 
-    // Drain shim telemetry (spin::Mutex -> futex, allowed by seccomp).
-    let (syscalls, files) = litebox_shim_linux::telemetry::take();
+    // Telemetry drain: the pinned litebox_shim_linux exposes no telemetry
+    // API (no `telemetry` module exists upstream). Rather than fabricate
+    // data, write an explicit unavailable marker so the telemetry file is
+    // always well-formed JSON and its absence is honest.
     let telem = serde_json::json!({
-        "syscalls": syscalls.iter().map(|s| serde_json::json!({"nr": s.nr, "ok": s.ok})).collect::<Vec<_>>(),
-        "files": files.iter().map(|f| serde_json::json!({"path": f.path, "write": f.write, "ok": f.ok})).collect::<Vec<_>>(),
+        "syscalls": [],
+        "files": [],
+        "unavailable": "litebox_shim_linux has no telemetry API",
     });
     let telem_str = serde_json::to_string(&telem).unwrap();
     unsafe {

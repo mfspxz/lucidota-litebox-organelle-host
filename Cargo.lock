@@ -460,6 +460,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common"
+version = "0.1.0"
+dependencies = [
+ "spin",
+]
+
+[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
@@ -484,6 +491,7 @@ dependencies = [
  "getrandom",
  "libc",
  "litebox",
+ "litebox_common",
  "litebox_common_linux",
  "seccompiler",
  "spin",
@@ -505,7 +513,6 @@ dependencies = [
  "object",
  "once_cell",
  "ringbuf",
- "spin",
  "syscalls",
  "thiserror",
  "zerocopy",
