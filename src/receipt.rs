@@ -50,8 +50,16 @@ pub struct Receipt {
     pub exit_status: String,
     pub timed_out: bool,
     pub resource_usage: ResourceUsage,
-    /// sha256 of captured guest stdout.
+    /// sha256 of captured guest stdout (retained prefix; see truncation fields).
     pub artifact_hash: String,
+    /// Guest stdout accounting (parent-side bounded drain).
+    pub stdout_stored_bytes: u64,
+    pub stdout_observed_bytes: u64,
+    pub stdout_truncated: bool,
+    /// Guest stderr accounting (parent-side bounded drain).
+    pub stderr_stored_bytes: u64,
+    pub stderr_observed_bytes: u64,
+    pub stderr_truncated: bool,
     /// sha256 of canonical manifest JSON.
     pub policy_hash: String,
     /// sha256 of the guest tar (what actually ran).

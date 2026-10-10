@@ -23,6 +23,16 @@ pub struct Manifest {
     pub memory_limit: u64,
     /// Wall-clock seconds; the watchdog SIGKILLs on expiry.
     pub timeout_secs: u64,
+    /// Max guest stdout bytes retained (parent-side). Default 16 MiB.
+    #[serde(default = "default_output_limit")]
+    pub stdout_limit_bytes: u64,
+    /// Max guest stderr bytes retained (parent-side). Default 16 MiB.
+    #[serde(default = "default_output_limit")]
+    pub stderr_limit_bytes: u64,
+}
+
+fn default_output_limit() -> u64 {
+    16 * 1024 * 1024
 }
 
 impl Manifest {
@@ -51,6 +61,14 @@ impl Manifest {
         }
         if self.memory_limit < 16 * 1024 * 1024 {
             bail!("memory_limit must be >= 16MiB");
+        }
+        if self.stdout_limit_bytes < 64 * 1024 || self.stdout_limit_bytes > 1024 * 1024 * 1024
+        {
+            bail!("stdout_limit_bytes must be in 64KiB..=1GiB");
+        }
+        if self.stderr_limit_bytes < 64 * 1024 || self.stderr_limit_bytes > 1024 * 1024 * 1024
+        {
+            bail!("stderr_limit_bytes must be in 64KiB..=1GiB");
         }
         for p in &self.filesystem_allowlist {
             let pb = PathBuf::from(p);

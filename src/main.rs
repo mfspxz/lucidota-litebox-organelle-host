@@ -75,9 +75,19 @@ fn real_main() -> Result<()> {
     // Clone the sandboxed child.
     let (_pending, child_pid) = sandbox::run_sandboxed(config)?;
 
-    // Drain stdout/stderr concurrently (avoid pipe-buffer deadlock).
-    let out_handle = std::thread::spawn(move || read_all(stdout_r));
-    let err_handle = std::thread::spawn(move || read_all(stderr_r));
+    // Drain stdout/stderr concurrently (avoid pipe-buffer deadlock) through
+    // BOUNDED drains: the guest's RLIMIT_AS does not constrain parent-side
+    // allocations, so an unbounded Vec<u8> here is a host-memory exhaustion
+    // vector. Output beyond the budget is dropped (hash covers what arrived
+    // up to the budget; the receipt records truncation honestly).
+    let stdout_path = workdir.join("stdout.bin");
+    let stderr_path = workdir.join("stderr.bin");
+    let out_budget = manifest.stdout_limit_bytes;
+    let err_budget = manifest.stderr_limit_bytes;
+    let out_handle =
+        std::thread::spawn(move || drain_bounded(stdout_r, out_budget, &stdout_path));
+    let err_handle =
+        std::thread::spawn(move || drain_bounded(stderr_r, err_budget, &stderr_path));
 
     // Watchdog.
     let timeout = Duration::from_secs(manifest.timeout_secs);
@@ -100,7 +110,7 @@ fn real_main() -> Result<()> {
     // Build the receipt.
     let (allowed, denied, total) = summarize_syscalls(&telem);
     let (files_read, files_written) = summarize_files(&telem);
-    let artifact_hash = hex(&Sha256::digest(&stdout));
+    let artifact_hash = stdout.hash_hex.clone();
 
     let exit_status = if result.timed_out {
         "timeout".to_string()
@@ -127,8 +137,20 @@ fn real_main() -> Result<()> {
     }
     if !stderr.is_empty() {
         caveats.push(format!(
-            "guest stderr ({} bytes) not in artifact_hash; see logs",
-            stderr.len()
+            "guest stderr ({} bytes observed, {} retained) not in artifact_hash; see logs",
+            stderr.observed_bytes, stderr.stored_bytes
+        ));
+    }
+    if stdout.truncated {
+        caveats.push(format!(
+            "guest stdout truncated at {} byte budget ({} bytes observed); artifact_hash covers retained prefix only",
+            manifest.stdout_limit_bytes, stdout.observed_bytes
+        ));
+    }
+    if stderr.truncated {
+        caveats.push(format!(
+            "guest stderr truncated at {} byte budget ({} bytes observed)",
+            manifest.stderr_limit_bytes, stderr.observed_bytes
         ));
     }
 
@@ -152,6 +174,12 @@ fn real_main() -> Result<()> {
             max_rss_kb: result.rusage.max_rss_kb,
         },
         artifact_hash,
+        stdout_stored_bytes: stdout.stored_bytes,
+        stdout_observed_bytes: stdout.observed_bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_stored_bytes: stderr.stored_bytes,
+        stderr_observed_bytes: stderr.observed_bytes,
+        stderr_truncated: stderr.truncated,
         policy_hash,
         tar_hash,
         network: "deny (no TUN device; net namespace has zero interfaces)".to_string(),
@@ -180,17 +208,59 @@ fn make_pipe() -> Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
-fn read_all(fd: RawFd) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
+/// Result of draining one guest output pipe through a byte budget.
+#[derive(Default)]
+struct Drain {
+    /// sha256 hex of the retained prefix.
+    hash_hex: String,
+    /// Bytes written to the sink file (<= budget).
+    stored_bytes: u64,
+    /// Total bytes read from the pipe (may exceed budget).
+    observed_bytes: u64,
+    /// True if output exceeded the budget and was dropped.
+    truncated: bool,
+}
+
+impl Drain {
+    fn is_empty(&self) -> bool {
+        self.observed_bytes == 0
+    }
+}
+
+/// Drain `fd` into `sink_path`, retaining at most `budget` bytes.
+/// The hash is incremental: parent memory stays O(1) regardless of how much
+/// the guest emits. Surplus bytes are counted, not stored.
+fn drain_bounded(fd: RawFd, budget: u64, sink_path: &std::path::Path) -> Drain {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut out = Drain::default();
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::create(sink_path).ok();
+    let mut buf = [0u8; 65536];
     loop {
         let rc = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if rc <= 0 {
             break;
         }
-        out.extend_from_slice(&buf[..rc as usize]);
+        let chunk = &buf[..rc as usize];
+        out.observed_bytes += chunk.len() as u64;
+        if out.stored_bytes < budget {
+            let room = budget - out.stored_bytes;
+            let take = chunk.len().min(room as usize);
+            hasher.update(&chunk[..take]);
+            if let Some(f) = file.as_mut() {
+                let _ = f.write_all(&chunk[..take]);
+            }
+            out.stored_bytes += take as u64;
+            if take < chunk.len() {
+                out.truncated = true;
+            }
+        } else {
+            out.truncated = true;
+        }
     }
     unsafe { libc::close(fd) };
+    out.hash_hex = hex(&hasher.finalize());
     out
 }
 
@@ -268,4 +338,60 @@ fn sanitize(s: &str) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1 regression: the bounded drain caps retained bytes, keeps hashing,
+    /// and reports truncation — parent memory stays O(1).
+    #[test]
+    fn drain_bounded_caps_and_hashes() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        // Write 3x the budget, then close the write end.
+        let payload = vec![0xABu8; 3000];
+        let mut written = 0;
+        while written < payload.len() {
+            let rc = unsafe {
+                libc::write(
+                    w,
+                    payload[written..].as_ptr() as *const _,
+                    payload.len() - written,
+                )
+            };
+            assert!(rc > 0);
+            written += rc as usize;
+        }
+        unsafe { libc::close(w) };
+        let sink = std::env::temp_dir().join(format!("drain-test-{}", std::process::id()));
+        let d = drain_bounded(r, 1000, &sink);
+        assert_eq!(d.stored_bytes, 1000);
+        assert_eq!(d.observed_bytes, 3000);
+        assert!(d.truncated);
+        assert_eq!(d.hash_hex, hex(&Sha256::digest(&payload[..1000])));
+        assert_eq!(std::fs::read(&sink).unwrap().len(), 1000);
+        let _ = std::fs::remove_file(&sink);
+    }
+
+    /// Under-budget output is retained fully and not marked truncated.
+    #[test]
+    fn drain_bounded_small_output_clean() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let payload = b"hello";
+        let rc = unsafe { libc::write(w, payload.as_ptr() as *const _, payload.len()) };
+        assert_eq!(rc as usize, payload.len());
+        unsafe { libc::close(w) };
+        let sink = std::env::temp_dir().join(format!("drain-test2-{}", std::process::id()));
+        let d = drain_bounded(r, 1000, &sink);
+        assert_eq!(d.stored_bytes, 5);
+        assert_eq!(d.observed_bytes, 5);
+        assert!(!d.truncated);
+        assert!(d.is_empty() == false);
+        let _ = std::fs::remove_file(&sink);
+    }
 }
