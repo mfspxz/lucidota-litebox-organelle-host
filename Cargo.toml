@@ -29,6 +29,10 @@ serde_json = "1.0"
 sha2 = "0.10"
 tar = "0.4"
 
+# Organelle migration (wave 4b-1): native Tier A registration surface
+organelle-host = { path = "../organelles/crates/organelle-host" }
+organelle-manifest = { path = "../organelles/crates/organelle-manifest" }
+
 [profile.release]
 # Keep debug info for honest stack traces in the pilot
 debug = true
