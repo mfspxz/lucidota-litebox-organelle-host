@@ -41,16 +41,25 @@ pub struct Receipt {
     pub sandbox: String,   // "litebox"
     pub platform: String,  // "linux_userland"
     pub outer_sandbox: OuterSandbox,
+    /// Telemetry status: "observed" or "unavailable: <reason>".
+    /// When unavailable, ALL the fields below are None (null in JSON) —
+    /// never empty vecs or zero counts. Absence of evidence is not
+    /// evidence of absence.
+    pub telemetry_status: String,
     /// Distinct guest syscall names observed OK (from shim telemetry).
-    pub syscalls_allowed: Vec<String>,
+    /// None = telemetry unavailable.
+    pub syscalls_allowed: Option<Vec<String>>,
     /// Distinct guest syscall names observed denied (shim Err).
-    pub syscalls_denied: Vec<String>,
-    /// Raw counts (may include repeats).
-    pub syscall_total: u64,
+    /// None = telemetry unavailable.
+    pub syscalls_denied: Option<Vec<String>>,
+    /// Raw counts (may include repeats). None = telemetry unavailable.
+    pub syscall_total: Option<u64>,
     /// Distinct guest paths opened read-only and successfully.
-    pub files_read: Vec<String>,
+    /// None = telemetry unavailable.
+    pub files_read: Option<Vec<String>>,
     /// Distinct guest paths opened for write and successfully.
-    pub files_written: Vec<String>,
+    /// None = telemetry unavailable.
+    pub files_written: Option<Vec<String>>,
     /// "exit(<code>)" | "signal(<name>)" | "timeout"
     pub exit_status: String,
     pub timed_out: bool,

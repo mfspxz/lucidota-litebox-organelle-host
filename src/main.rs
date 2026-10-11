@@ -158,8 +158,33 @@ fn real_main() -> Result<()> {
         .filter(|s| !s.trim().is_empty());
 
     // Build the receipt.
-    let (allowed, denied, total) = summarize_syscalls(&telem);
-    let (files_read, files_written) = summarize_files(&telem);
+    //
+    // Telemetry honesty (fix 6): the pinned shim exposes no telemetry API,
+    // so `telem` carries an explicit "unavailable" marker synthesized by the
+    // parent. In that case every telemetry field is None — never an empty
+    // vec or a zero count masquerading as "nothing happened".
+    let telemetry_unavailable: Option<String> = telem
+        .get("unavailable")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let telemetry_status = match &telemetry_unavailable {
+        Some(reason) => format!("unavailable: {reason}"),
+        None => "observed".to_string(),
+    };
+    let (syscalls_allowed, syscalls_denied, syscall_total) = match &telemetry_unavailable {
+        Some(_) => (None, None, None),
+        None => {
+            let (a, d, t) = summarize_syscalls(&telem);
+            (Some(a), Some(d), Some(t))
+        }
+    };
+    let (files_read, files_written) = match &telemetry_unavailable {
+        Some(_) => (None, None),
+        None => {
+            let (r, w) = summarize_files(&telem);
+            (Some(r), Some(w))
+        }
+    };
     let artifact_hash = stdout.hash_hex.clone();
 
     let exit_status = if result.timed_out {
@@ -177,13 +202,32 @@ fn real_main() -> Result<()> {
     };
 
     let mut caveats = vec![
-        "landlock: kernel does not expose it; not enforced (outer seccomp + mount ns cover file access)".to_string(),
         "syscall rewriter is best-effort (R2): the outer seccomp-BPF deny-by-default is the enforcement layer".to_string(),
         "does NOT defend against kernel exploits or microarchitectural side channels".to_string(),
     ];
     // Measured sandbox description (fail-closed on missing evidence).
+    // Network claim built from the measured interface list, not a slogan.
+    let network = match &setup {
+        Some(s) => format!(
+            "deny (no TUN device; net namespace interfaces: {:?})",
+            s.net_ifaces
+        ),
+        None => "deny (no TUN device; interfaces not_measured)".to_string(),
+    };
     let (outer_sandbox, mut setup_caveats) = sandbox::describe_measured(setup);
+    // Landlock honesty: the old hard-coded "kernel does not expose it" was
+    // wrong on kernels that do — report what was measured.
+    if outer_sandbox.landlock.starts_with("unavailable") {
+        caveats.push(
+            "landlock: unavailable on this host; not enforced (outer seccomp + mount ns cover file access)".to_string(),
+        );
+    }
     caveats.append(&mut setup_caveats);
+    if let Some(reason) = &telemetry_unavailable {
+        caveats.push(format!(
+            "guest syscall/file telemetry unavailable: {reason}; telemetry fields are null, not zero"
+        ));
+    }
     if let Some(e) = setup_error {
         caveats.push(format!("child setup error: {}", e.trim()));
     }
@@ -222,9 +266,10 @@ fn real_main() -> Result<()> {
         sandbox: "litebox".to_string(),
         platform: "linux_userland".to_string(),
         outer_sandbox,
-        syscalls_allowed: allowed,
-        syscalls_denied: denied,
-        syscall_total: total,
+        telemetry_status,
+        syscalls_allowed,
+        syscalls_denied,
+        syscall_total,
         files_read,
         files_written,
         exit_status,
@@ -244,7 +289,7 @@ fn real_main() -> Result<()> {
         stderr_truncated: stderr.truncated,
         policy_hash,
         tar_hash,
-        network: "deny (no TUN device; net namespace has zero interfaces)".to_string(),
+        network,
         caveats,
     };
 
