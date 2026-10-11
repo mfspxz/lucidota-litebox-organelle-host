@@ -13,11 +13,12 @@
 
 use litebox_organelle_host::organelle_impl::litebox_host_organelle;
 use organelle_host::{CallContext, CallVerdict, Host};
+use organelle_manifest::Transport;
 use serde_json::{json, Value};
 
 fn static_manifest() -> Value {
     let path = format!(
-        "{}/../organelles/litebox-host.manifest.json",
+        "{}/organelles/litebox-host.manifest.json",
         env!("CARGO_MANIFEST_DIR")
     );
     let text = std::fs::read_to_string(&path).expect("static manifest present");
@@ -81,6 +82,7 @@ fn run_op_rejects_bad_guest_manifest_honestly() {
         .call_with_grant(
             &grant,
             None,
+            Transport::Native,
             "lh",
             "run",
             json!({"manifest": {}, "host_bin": host_bin}),

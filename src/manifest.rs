@@ -29,10 +29,30 @@ pub struct Manifest {
     /// Max guest stderr bytes retained (parent-side). Default 16 MiB.
     #[serde(default = "default_output_limit")]
     pub stderr_limit_bytes: u64,
+    /// RLIMIT_NPROC: max tasks (processes + threads) for the child.
+    /// Defense-in-depth under the seccomp clone policy.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: u64,
+    /// If true, the seccomp filter allows clone/clone3 (still bounded by
+    /// max_processes). Default false: task creation is denied outright.
+    /// Intended to be governor-authorized (signature-bound) for threaded
+    /// guests; a caller-supplied true without a verified signature is
+    /// rejected when --trusted-key is in effect (see auth).
+    #[serde(default)]
+    pub allow_clone: bool,
+    /// Keep the run workdir (guest stdout/stderr dumps, tar, telemetry)
+    /// after the run for forensics/evidence. Default false (cleaned on
+    /// success, kept on failure).
+    #[serde(default)]
+    pub keep_workdir: bool,
 }
 
 fn default_output_limit() -> u64 {
     16 * 1024 * 1024
+}
+
+fn default_max_processes() -> u64 {
+    64
 }
 
 impl Manifest {
@@ -69,6 +89,9 @@ impl Manifest {
         if self.stderr_limit_bytes < 64 * 1024 || self.stderr_limit_bytes > 1024 * 1024 * 1024
         {
             bail!("stderr_limit_bytes must be in 64KiB..=1GiB");
+        }
+        if self.max_processes == 0 || self.max_processes > 4096 {
+            bail!("max_processes must be in 1..=4096");
         }
         for p in &self.filesystem_allowlist {
             let pb = PathBuf::from(p);

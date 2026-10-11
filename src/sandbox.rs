@@ -442,7 +442,10 @@ fn setup_mounts(config: &SandboxConfig) -> Result<()> {
     Ok(())
 }
 
-/// RLIMIT_AS + RLIMIT_CPU (cgroup v2 not writable here; documented fallback).
+/// RLIMIT_AS + RLIMIT_CPU + RLIMIT_NPROC (cgroup v2 not writable here;
+/// documented fallback). NPROC bounds tasks for the child's real UID
+/// (nobody/65534 on the host), so a fork bomb cannot exhaust host PIDs even
+/// if the seccomp clone policy were bypassed.
 fn apply_rlimits(manifest: &Manifest) -> Result<()> {
     let mem = libc::rlimit {
         rlim_cur: manifest.memory_limit,
@@ -457,6 +460,13 @@ fn apply_rlimits(manifest: &Manifest) -> Result<()> {
     };
     if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &cpu) } != 0 {
         bail!("setrlimit CPU failed");
+    }
+    let nproc = libc::rlimit {
+        rlim_cur: manifest.max_processes,
+        rlim_max: manifest.max_processes,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &nproc) } != 0 {
+        bail!("setrlimit NPROC failed");
     }
     Ok(())
 }
@@ -506,15 +516,22 @@ fn drop_capabilities() -> Result<()> {
 /// kernel-enforced boundary that closes the rewriter-bypass hole (R2):
 /// a JIT'd `syscall` instruction becomes a REAL host syscall, and the
 /// kernel kills the process.
-pub fn apply_seccomp_filter() -> Result<()> {
+///
+/// Task creation: clone/clone3 are DENIED unless the manifest explicitly
+/// sets allow_clone (governor-authorized, signature-bound). A PID namespace
+/// limits visibility, not host resources — so the default is denial, and
+/// RLIMIT_NPROC (set in apply_rlimits) bounds tasks even when cloning is
+/// allowed. Namespace-creating clone flags need no seccomp arg-check: the
+/// child holds zero capabilities, so the kernel refuses them with EPERM.
+pub fn apply_seccomp_filter(allow_clone: bool) -> Result<()> {
     use seccompiler::{
         BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
         SeccompFilter, SeccompRule,
     };
 
-    // Mirrors the LiteBox platform's proven allowlist, plus `clone` and
-    // `openat` (RDONLY) for Rust std. Everything else -> KillProcess.
-    let rules: Vec<(i64, Vec<SeccompRule>)> = vec![
+    // Mirrors the LiteBox platform's proven allowlist, plus `openat`
+    // (RDONLY) for Rust std. Everything else -> KillProcess.
+    let mut rules: Vec<(i64, Vec<SeccompRule>)> = vec![
         (libc::SYS_read, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_poll, vec![]),
@@ -532,8 +549,6 @@ pub fn apply_seccomp_filter() -> Result<()> {
         (libc::SYS_rt_sigprocmask, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_exit_group, vec![]),
-        (libc::SYS_clone, vec![]),
-        (libc::SYS_clone3, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_getrandom, vec![]),
         (libc::SYS_rseq, vec![]),
@@ -552,7 +567,7 @@ pub fn apply_seccomp_filter() -> Result<()> {
                 1,
                 SeccompCmpArgLen::Dword,
                 SeccompCmpOp::Eq,
-                (libc::O_RDONLY as u64),
+                libc::O_RDONLY as u64,
             )
             .unwrap()])
             .unwrap()],
@@ -563,7 +578,7 @@ pub fn apply_seccomp_filter() -> Result<()> {
                 2,
                 SeccompCmpArgLen::Dword,
                 SeccompCmpOp::Eq,
-                (libc::O_RDONLY as u64),
+                libc::O_RDONLY as u64,
             )
             .unwrap()])
             .unwrap()],
@@ -580,6 +595,15 @@ pub fn apply_seccomp_filter() -> Result<()> {
         // syscall. Safe: can only ADD filters (more restrictive), never remove.
         (libc::SYS_seccomp, vec![]),
     ];
+    if allow_clone {
+        // Governor-authorized threaded guests: cloning permitted, still
+        // bounded by RLIMIT_NPROC. Namespace-creating flags are refused by
+        // the kernel (zero capabilities -> EPERM), so no arg checks needed.
+        rules.push((libc::SYS_clone, vec![]));
+        rules.push((libc::SYS_clone3, vec![]));
+    }
+    // Note: clone/clone3 are ABSENT by default -> KillProcess. A PID
+    // namespace limits visibility, not host resources; denial is the quota.
     let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
         rules.into_iter().collect();
     let filter = SeccompFilter::new(
@@ -592,4 +616,65 @@ pub fn apply_seccomp_filter() -> Result<()> {
     let bpf_prog: BpfProgram = filter.try_into().context("compiling BPF")?;
     seccompiler::apply_filter(&bpf_prog).context("applying seccomp filter")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1 regression (isolated-filter scope): a process under the default
+    /// filter that attempts clone must die by SIGSYS — the kernel kills it,
+    /// no userspace policy involved.
+    #[test]
+    fn clone_denied_by_default_filter() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: install the default (allow_clone=false) filter, then
+            // attempt the forbidden syscall. Must not return.
+            apply_seccomp_filter(false).expect("filter install failed");
+            let rc = unsafe { libc::syscall(libc::SYS_clone, 0u64, 0u64, 0u64, 0u64, 0u64) };
+            // If we get here the filter did NOT kill us: fail loudly.
+            unsafe { libc::_exit(100 + (rc < 0) as i32) };
+        }
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(rc, pid);
+        // WIFSIGNALED && WTERMSIG == SIGSYS (31)
+        assert!(
+            (status & 0x7f) != 0 && (status & 0x7f) != 0x7f,
+            "child was not killed by a signal (status={status:#x})"
+        );
+        assert_eq!(
+            status & 0x7f,
+            libc::SIGSYS,
+            "child died by signal {}, expected SIGSYS",
+            status & 0x7f
+        );
+    }
+
+    /// allow_clone=true keeps clone usable (governor-authorized threaded
+    /// guests); the RLIMIT_NPROC quota is the bound there (tested full-stack).
+    #[test]
+    fn clone_allowed_when_authorized() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            apply_seccomp_filter(true).expect("filter install failed");
+            // fork() via libc uses clone; must succeed and the child exits.
+            let c = unsafe { libc::fork() };
+            if c == 0 {
+                unsafe { libc::_exit(42) };
+            }
+            assert!(c > 0, "clone denied despite allow_clone=true");
+            let mut st = 0;
+            unsafe { libc::waitpid(c, &mut st, 0) };
+            let code = (st >> 8) & 0xff;
+            unsafe { libc::_exit(if code == 42 { 0 } else { 101 }) };
+        }
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(rc, pid);
+        assert_eq!((status >> 8) & 0xff, 0, "allow_clone path failed");
+    }
 }

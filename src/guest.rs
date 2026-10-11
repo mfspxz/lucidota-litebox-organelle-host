@@ -84,7 +84,7 @@ fn run_guest_inner(
     // filter; both must allow what the runner needs.
     // Outer seccomp-BPF (deny-by-default, kill). Applied here, after FS setup
     // (like the upstream runner), right before the inner filter.
-    crate::sandbox::apply_seccomp_filter().expect("outer seccomp failed");
+    crate::sandbox::apply_seccomp_filter(config.manifest.allow_clone).expect("outer seccomp failed");
     Platform::enable_seccomp_filter();
 
     let program = shim
