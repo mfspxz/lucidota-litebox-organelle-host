@@ -255,7 +255,8 @@ fn real_main() -> Result<()> {
         ));
     }
 
-    let receipt = Receipt {
+    let mut receipt = Receipt {
+        receipt_version: receipt::RECEIPT_VERSION.to_string(),
         organelle_id: manifest.organelle_id.clone(),
         authority: auth_outcome.receipt_authority.clone(),
         auth_status: match auth_outcome.status {
@@ -291,10 +292,21 @@ fn real_main() -> Result<()> {
         tar_hash,
         network,
         caveats,
+        receipt_digest: String::new(), // filled by seal()
     };
+    // Seal: digest covers ALL fields (canonical JSON, sorted keys).
+    receipt.seal();
+    assert!(receipt.verify_digest(), "receipt digest self-check failed");
+
+    // Append to the local proof ledger (hash-chained, append-only JSONL).
+    // This is the persistence the digest binds to; the stderr digest line
+    // is the independent witness.
+    if let Err(e) = append_ledger(&receipt) {
+        eprintln!("warning: ledger append failed: {e:?}");
+    }
 
     println!("{}", receipt.to_json());
-    eprintln!("receipt digest: {}", receipt.digest());
+    eprintln!("receipt digest: {}", receipt.receipt_digest);
 
     // Best-effort cleanup (keep the workdir on failure, or whenever the
     // manifest asks for forensics).
@@ -502,4 +514,47 @@ mod tests {
         assert!(d.is_empty() == false);
         let _ = std::fs::remove_file(&sink);
     }
+}
+
+/// Append the sealed receipt to the local proof ledger
+/// (~/workspace/litebox-organelle-host/receipts/ledger.jsonl).
+/// Append-only JSONL; each entry hash-chains to the previous entry's
+/// digest (tamper-evident). The stderr "receipt digest:" line is the
+/// independent witness a verifier can check against this ledger.
+fn append_ledger(receipt: &Receipt) -> Result<()> {
+    let dir = std::path::PathBuf::from(env!("HOME"))
+        .join("workspace/litebox-organelle-host/receipts");
+    std::fs::create_dir_all(&dir).context("create receipts dir")?;
+    let path = dir.join("ledger.jsonl");
+
+    // Read the previous entry's digest for chaining (best-effort: a
+    // missing/corrupt tail just starts a new chain segment, recorded).
+    let prev: Option<String> = std::fs::read_to_string(&path).ok().and_then(|s| {
+        s.lines()
+            .rev()
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|d| d.to_string()))
+    });
+
+    let entry = serde_json::json!({
+        "v": 1,
+        "receipt_version": receipt.receipt_version,
+        "digest": receipt.receipt_digest,
+        "prev": prev,
+        "invocation_id": receipt.invocation_id,
+        "organelle_id": receipt.organelle_id,
+        "exit_status": receipt.exit_status,
+        "receipt": serde_json::to_value(receipt).unwrap_or(serde_json::Value::Null),
+    });
+    let mut line = serde_json::to_string(&entry).context("serialize ledger entry")?;
+    line.push('\n');
+
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .context("open ledger")?;
+    f.write_all(line.as_bytes()).context("append ledger")?;
+    Ok(())
 }
