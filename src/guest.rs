@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use std::ffi::CString;
-use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use crate::sandbox::SandboxConfig;
@@ -15,14 +14,18 @@ extern crate alloc;
 
 /// Run the guest. Does not return normally — exits the process with the
 /// guest's exit code (like the upstream runner).
-pub fn run_guest(config: &SandboxConfig, tar_data: &'static [u8], telemetry_fd: RawFd) -> ! {
-    let code = match run_guest_inner(config, tar_data, telemetry_fd) {
+pub fn run_guest(config: &SandboxConfig, tar_data: &'static [u8]) -> ! {
+    let code = match run_guest_inner(config, tar_data) {
         Ok(code) => code,
         Err(e) => {
-            // Best effort: report via the telemetry fd, then die.
+            // Best effort: report via stderr (the parent's pipe), then die.
+            // (There is no telemetry fd anymore: post-filter syscalls like
+            // lseek/ftruncate are not allowlisted, so the child cannot
+            // rewind a file after the guest runs. The parent synthesizes
+            // the shim-telemetry "unavailable" marker itself.)
             let msg = format!("{{\"guest_error\": {e:?}}}\n");
             unsafe {
-                libc::write(telemetry_fd, msg.as_ptr() as *const _, msg.len());
+                libc::write(2, msg.as_ptr() as *const _, msg.len());
             }
             127
         }
@@ -30,11 +33,7 @@ pub fn run_guest(config: &SandboxConfig, tar_data: &'static [u8], telemetry_fd: 
     unsafe { libc::_exit(code) };
 }
 
-fn run_guest_inner(
-    config: &SandboxConfig,
-    tar_data: &'static [u8],
-    telemetry_fd: RawFd,
-) -> Result<i32> {
+fn run_guest_inner(config: &SandboxConfig, tar_data: &'static [u8]) -> Result<i32> {
     use litebox::fs::{in_mem, Mode, UserInfo};
     use litebox_platform_linux_userland::LinuxUserland as Platform;
 
@@ -99,21 +98,6 @@ fn run_guest_inner(
     }
 
     let exit_code = program.process.wait_for_unix_shell_exit_code();
-
-    // Telemetry drain: the pinned litebox_shim_linux exposes no telemetry
-    // API (no `telemetry` module exists upstream). Rather than fabricate
-    // data, write an explicit unavailable marker so the telemetry file is
-    // always well-formed JSON and its absence is honest.
-    let telem = serde_json::json!({
-        "syscalls": [],
-        "files": [],
-        "unavailable": "litebox_shim_linux has no telemetry API",
-    });
-    let telem_str = serde_json::to_string(&telem).unwrap();
-    unsafe {
-        libc::write(telemetry_fd, telem_str.as_ptr() as *const _, telem_str.len());
-        libc::close(telemetry_fd);
-    }
 
     Ok(exit_code)
 }

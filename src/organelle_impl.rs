@@ -71,7 +71,10 @@ fn litebox_host_manifest() -> OrganelleManifest {
 }
 
 fn op_describe() -> Result<Value, OrganelleError> {
-    serde_json::to_value(sandbox::describe())
+    // Static capability advertisement (what this build CAN do), not a
+    // measurement. Per-run measured sandbox state appears in receipts via
+    // sandbox::describe_measured(). See sandbox.rs.
+    serde_json::to_value(sandbox::advertise())
         .map_err(|e| OrganelleError::failed(format!("describe: {e}")))
 }
 

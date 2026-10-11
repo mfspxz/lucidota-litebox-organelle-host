@@ -49,7 +49,8 @@ fn describe_runs_live_through_host() {
     host.register(litebox_host_organelle()).unwrap();
     let ctx = CallContext::new("test", vec![]);
     let out = host.call(&ctx, "lh", "describe", json!({})).expect("describe");
-    // The real sandbox::describe() output: measured booleans, not assumed.
+    // The static capability advertisement: what this build CAN enforce.
+    // (Per-run measured sandbox state appears in receipts, not here.)
     assert_eq!(
         out.output.get("capabilities_dropped").and_then(|v| v.as_bool()),
         Some(true)

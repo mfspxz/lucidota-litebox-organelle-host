@@ -129,15 +129,33 @@ fn real_main() -> Result<()> {
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
 
-    // Telemetry (written by the child after the guest exits).
-    let telem_path = workdir.join("telemetry.json");
-    let telem: serde_json::Value = std::fs::read_to_string(&telem_path)
+    // Setup report (measured by the child before seccomp installed).
+    // Missing/unparseable -> every claim becomes "not_measured", never zero.
+    let setup: Option<sandbox::SetupReport> = std::fs::read_to_string(workdir.join("setup_report.json"))
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::json!({"syscalls": [], "files": []}));
+        .and_then(|s| serde_json::from_str(&s).ok());
 
-    // Setup errors (if the child died before running the guest).
-    let setup_error = std::fs::read_to_string(&error_path).ok().filter(|s| !s.is_empty());
+    // Shim telemetry: the pinned litebox_shim_linux exposes no telemetry
+    // API. The parent synthesizes the explicit unavailable marker itself —
+    // the old child-written telemetry.json is gone (writing it required
+    // post-filter lseek/ftruncate, which are not allowlisted).
+    let telem = serde_json::json!({
+        "syscalls": [],
+        "files": [],
+        "unavailable": "litebox_shim_linux has no telemetry API",
+    });
+
+    // Setup errors (if the child died before running the guest). Lines
+    // starting with "stage: " are progress markers, not errors.
+    let setup_error = std::fs::read_to_string(&error_path)
+        .ok()
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.starts_with("stage:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.trim().is_empty());
 
     // Build the receipt.
     let (allowed, denied, total) = summarize_syscalls(&telem);
@@ -160,10 +178,12 @@ fn real_main() -> Result<()> {
 
     let mut caveats = vec![
         "landlock: kernel does not expose it; not enforced (outer seccomp + mount ns cover file access)".to_string(),
-        "cgroup v2: not writable in this environment; RLIMIT_AS + RLIMIT_CPU used instead".to_string(),
         "syscall rewriter is best-effort (R2): the outer seccomp-BPF deny-by-default is the enforcement layer".to_string(),
         "does NOT defend against kernel exploits or microarchitectural side channels".to_string(),
     ];
+    // Measured sandbox description (fail-closed on missing evidence).
+    let (outer_sandbox, mut setup_caveats) = sandbox::describe_measured(setup);
+    caveats.append(&mut setup_caveats);
     if let Some(e) = setup_error {
         caveats.push(format!("child setup error: {}", e.trim()));
     }
@@ -201,7 +221,7 @@ fn real_main() -> Result<()> {
         invocation_id: auth_outcome.invocation_id.clone(),
         sandbox: "litebox".to_string(),
         platform: "linux_userland".to_string(),
-        outer_sandbox: sandbox::describe(),
+        outer_sandbox,
         syscalls_allowed: allowed,
         syscalls_denied: denied,
         syscall_total: total,

@@ -21,6 +21,29 @@ const NOBODY: u32 = 65534;
 /// Child setup failure exit code (distinguishes from guest exit codes).
 const SETUP_FAILED: i32 = 127;
 
+/// What the child measured about the sandbox it built (written pre-filter,
+/// read by the parent for the receipt). Every field is an observation, not
+/// an assumption; a missing/unparseable report becomes "not_measured".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SetupReport {
+    /// getpid() == 1 (we are PID 1 in the new PID namespace).
+    pub pid_is_one: bool,
+    /// Interface names visible in the new net namespace (expect ["lo"]).
+    pub net_ifaces: Vec<String>,
+    /// RLIMIT_AS read back after apply_rlimits.
+    pub rlimit_as: u64,
+    /// RLIMIT_CPU read back after apply_rlimits.
+    pub rlimit_cpu: u64,
+    /// RLIMIT_NPROC read back after apply_rlimits.
+    pub rlimit_nproc: u64,
+    /// CapEff (hex) before drop_capabilities, from /proc/self/status.
+    pub pre_drop_cap_eff: String,
+    /// CapEff == 0 after drop_capabilities, via capget.
+    pub cap_eff_zero_after_drop: bool,
+    /// /sys/kernel/security exists (Landlock availability probe).
+    pub landlock_available: bool,
+}
+
 /// Configuration for one sandboxed run. Built by the parent, consumed by the child.
 pub struct SandboxConfig {
     pub workdir: PathBuf,
@@ -45,17 +68,84 @@ pub struct SandboxResult {
     pub wall_ms: u64,
 }
 
-/// What the outer sandbox actually enforced (measured, for the receipt).
-pub fn describe() -> OuterSandbox {
+/// Static capability advertisement for the `describe` op: what this build
+/// CAN enforce, not a measurement of any live run. Per-run measured values
+/// appear in receipts via describe_measured(). Do not confuse the two.
+pub fn advertise() -> OuterSandbox {
     OuterSandbox {
         user_ns: true,
         mount_ns: true,
         pid_ns: true,
         net_ns: true,
         seccomp: "deny-by-default (SECCOMP_RET_KILL_PROCESS)".to_string(),
-        landlock: "unavailable: /sys/kernel/security absent".to_string(),
-        resource_limits: "rlimit fallback: cgroup v2 not writable in this environment".to_string(),
+        landlock: "host-dependent; measured per-run".to_string(),
+        resource_limits: "rlimit-based; cgroup v2 if writable; measured per-run".to_string(),
         capabilities_dropped: true,
+    }
+}
+
+/// What the outer sandbox actually enforced — MEASURED by the child and
+/// reported via setup_report.json. Returns the description plus any
+/// honesty caveats. A missing/unparseable report yields all-false with an
+/// explicit caveat: never convert missing evidence into success claims.
+pub fn describe_measured(setup: Option<SetupReport>) -> (OuterSandbox, Vec<String>) {
+    let mut caveats = Vec::new();
+    match setup {
+        Some(s) => {
+            let net_ok = s.net_ifaces.iter().all(|i| i == "lo");
+            if !net_ok {
+                caveats.push(format!(
+                    "net namespace has unexpected interfaces: {:?} (expected [\"lo\"])",
+                    s.net_ifaces
+                ));
+            }
+            if !s.pid_is_one {
+                caveats.push("child is not PID 1: PID namespace setup NOT confirmed".to_string());
+            }
+            if !s.cap_eff_zero_after_drop {
+                caveats.push("post-drop CapEff != 0: capability drop NOT confirmed".to_string());
+            }
+            (
+                OuterSandbox {
+                    // The child is alive: clone(CLONE_NEWUSER|CLONE_NEWNS|
+                    // CLONE_NEWPID|CLONE_NEWNET) succeeded (else no report).
+                    user_ns: true,
+                    mount_ns: true,
+                    pid_ns: s.pid_is_one,
+                    net_ns: net_ok,
+                    seccomp: "deny-by-default (SECCOMP_RET_KILL_PROCESS); install returned Ok pre-guest (fail-closed)".to_string(),
+                    landlock: if s.landlock_available {
+                        "available on host but not used by this pilot".to_string()
+                    } else {
+                        "unavailable: /sys/kernel/security absent".to_string()
+                    },
+                    resource_limits: format!(
+                        "rlimit AS={} CPU={}s NPROC={} (read back via getrlimit); cgroup v2 not writable in this environment",
+                        s.rlimit_as, s.rlimit_cpu, s.rlimit_nproc
+                    ),
+                    capabilities_dropped: s.cap_eff_zero_after_drop,
+                },
+                caveats,
+            )
+        }
+        None => {
+            caveats.push(
+                "setup_report.json missing or unparseable: NO sandbox claim below was measured; all booleans are false (not_measured)".to_string(),
+            );
+            (
+                OuterSandbox {
+                    user_ns: false,
+                    mount_ns: false,
+                    pid_ns: false,
+                    net_ns: false,
+                    seccomp: "not_measured".to_string(),
+                    landlock: "not_measured".to_string(),
+                    resource_limits: "not_measured".to_string(),
+                    capabilities_dropped: false,
+                },
+                caveats,
+            )
+        }
     }
 }
 
@@ -231,17 +321,29 @@ fn child_entry(config: &SandboxConfig) -> Result<i32> {
         unsafe { libc::close(config.sync_r) };
     }
 
-    // Open telemetry + error files BEFORE pivot_root (host paths visible now).
-    let telemetry_path = config.workdir.join("telemetry.json");
-    let telemetry_fd: RawFd = unsafe {
-        let c = std::ffi::CString::new(telemetry_path.to_string_lossy().as_bytes())?;
+    // Open the setup-report + error files BEFORE pivot_root (host paths
+    // visible now). The report is written after the sandbox is built but
+    // before seccomp filters install (no lseek/ftruncate-class syscalls are
+    // available afterwards); the fd is closed before the guest runs so the
+    // guest cannot touch it.
+    let report_path = config.workdir.join("setup_report.json");
+    let report_fd: RawFd = unsafe {
+        let c = std::ffi::CString::new(report_path.to_string_lossy().as_bytes())?;
         let fd = libc::open(
             c.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
             0o644,
         );
         if fd < 0 {
-            bail!("open telemetry file failed");
+            bail!("open setup report failed");
+        }
+        fd
+    };
+    // /dev/null for the guest's stdin (no /dev after pivot_root, so open now).
+    let devnull_fd: RawFd = unsafe {
+        let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        if fd < 0 {
+            bail!("open /dev/null failed");
         }
         fd
     };
@@ -267,25 +369,28 @@ fn child_entry(config: &SandboxConfig) -> Result<i32> {
     let tar_data = std::fs::read(&tar_path).context("read guest.tar")?;
     let tar_static: &'static [u8] = Box::leak(tar_data.into_boxed_slice());
 
+    // 0. Resource limits first (no fs dependency), then MEASURE what we
+    //    actually built. Every value below is observed, not assumed.
+    if let Err(e) = apply_rlimits(&config.manifest) {
+        log_err(&format!("apply_rlimits failed: {e:?}\n"));
+        return Ok(SETUP_FAILED);
+    }
+    let mut report = measure_setup()?;
+
     // 1. Mount namespace setup (pivot_root hides the host).
     if let Err(e) = setup_mounts(config) {
         log_err(&format!("setup_mounts failed: {e:?}\n"));
         return Ok(SETUP_FAILED);
     }
 
-    // 2. Resource limits (before dropping privileges).
-    if let Err(e) = apply_rlimits(&config.manifest) {
-        log_err(&format!("apply_rlimits failed: {e:?}\n"));
-        return Ok(SETUP_FAILED);
-    }
-
-    // 3. Drop all capabilities. (The uid_map already maps us to 65534/nobody
+    // 2. Drop all capabilities. (The uid_map already maps us to 65534/nobody
     //    on the host, so an explicit setuid is redundant — and would fail
     //    after we drop CAP_SETUID. In-ns uid 0 with zero caps is powerless.)
     if let Err(e) = drop_capabilities() {
         log_err(&format!("drop_capabilities failed: {e:?}\n"));
         return Ok(SETUP_FAILED);
     }
+    report.cap_eff_zero_after_drop = cap_eff_is_zero()?;
 
     // 4. Redirect stdout/stderr to the parent's pipes (guest output).
     unsafe {
@@ -300,13 +405,56 @@ fn child_entry(config: &SandboxConfig) -> Result<i32> {
     }
 
     log_err("stage: pre-seccomp\n");
+
+    // 5. FD HYGIENE. The child inherits every fd the parent had open: pipe
+    //    read ends, the sync pipe, and anything the operator's process held
+    //    (secret files, sockets). The seccomp filter allows read/write
+    //    without fd restrictions, so an inherited fd is a live capability.
+    //    Construct the guest's fd table explicitly:
+    //      - setup-error logging is complete: close error_fd;
+    //      - stdin becomes /dev/null (never the parent's stdin);
+    //      - stdout/stderr are already the parent's pipes;
+    //      - everything else is closed. The setup report fd is written and
+    //        closed BEFORE this point, so the guest never sees it.
+    unsafe { libc::close(error_fd) };
+    unsafe {
+        libc::dup2(devnull_fd, 0);
+        if devnull_fd > 2 {
+            libc::close(devnull_fd);
+        }
+    }
+
+    // Write the setup report now: sandbox built, filters not yet installed
+    // (plain write needs no lseek/ftruncate-class syscalls), and the fd is
+    // closed before the guest runs so the guest cannot forge measurements.
+    {
+        let json = serde_json::to_string(&report).context("serialize setup report")?;
+        let bytes = json.as_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            let rc = unsafe {
+                libc::write(
+                    report_fd,
+                    bytes[written..].as_ptr() as *const _,
+                    bytes.len() - written,
+                )
+            };
+            if rc <= 0 {
+                bail!("write setup report failed");
+            }
+            written += rc as usize;
+        }
+        unsafe { libc::close(report_fd) };
+    }
+    sanitize_fds(&[]);
+
     // 6. Outer seccomp filter is applied LATER, in run_guest_inner, right
     //    before the inner filter (after FS setup, like the upstream runner).
     //    See guest.rs.
 
     // 7. Run the LiteBox guest (inner personality). Never returns normally;
     //    exits the process with the guest's exit code.
-    crate::guest::run_guest(config, tar_static, telemetry_fd)
+    crate::guest::run_guest(config, tar_static)
 }
 
 /// Make all mounts private, build an empty root with only allowlist binds.
@@ -677,4 +825,117 @@ mod tests {
         assert_eq!(rc, pid);
         assert_eq!((status >> 8) & 0xff, 0, "allow_clone path failed");
     }
+}
+
+/// Close every file descriptor except 0, 1, 2 and those in `preserve`.
+/// The upper bound comes from RLIMIT_NOFILE so no inherited fd survives,
+/// however high-numbered.
+fn sanitize_fds(preserve: &[RawFd]) {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let max_fd = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        rl.rlim_cur.min(1 << 20) as i32
+    } else {
+        1024
+    };
+    for fd in 3..max_fd {
+        if preserve.contains(&fd) {
+            continue;
+        }
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Measure what the child actually built. Called after apply_rlimits, before
+/// setup_mounts (needs /proc and the pre-pivot filesystem for some probes).
+fn measure_setup() -> Result<SetupReport> {
+    // PID namespace: we must be PID 1 in the new namespace.
+    let pid_is_one = unsafe { libc::getpid() } == 1;
+
+    // Net namespace: list interfaces (fresh net ns has only lo, if that).
+    let mut net_ifaces = Vec::new();
+    unsafe {
+        let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut addrs) == 0 {
+            let mut cur = addrs;
+            while !cur.is_null() {
+                let name = std::ffi::CStr::from_ptr((*cur).ifa_name);
+                let s = name.to_string_lossy().into_owned();
+                if !net_ifaces.contains(&s) {
+                    net_ifaces.push(s);
+                }
+                cur = (*cur).ifa_next;
+            }
+            libc::freeifaddrs(addrs);
+        }
+    }
+
+    // Rlimits: read back what apply_rlimits set.
+    let get = |res: libc::__rlimit_resource_t| -> Result<u64> {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if unsafe { libc::getrlimit(res, &mut rl) } != 0 {
+            bail!("getrlimit failed");
+        }
+        Ok(rl.rlim_cur)
+    };
+    let rlimit_as = get(libc::RLIMIT_AS)?;
+    let rlimit_cpu = get(libc::RLIMIT_CPU)?;
+    let rlimit_nproc = get(libc::RLIMIT_NPROC)?;
+
+    // Pre-drop CapEff from /proc/self/status (gone after pivot_root).
+    let pre_drop_cap_eff = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("CapEff:"))
+        .unwrap_or("CapEff:\t?")
+        .to_string();
+
+    // Landlock availability probe.
+    let landlock_available = std::path::Path::new("/sys/kernel/security").exists();
+
+    Ok(SetupReport {
+        pid_is_one,
+        net_ifaces,
+        rlimit_as,
+        rlimit_cpu,
+        rlimit_nproc,
+        pre_drop_cap_eff,
+        cap_eff_zero_after_drop: false, // filled after drop_capabilities
+        landlock_available,
+    })
+}
+
+/// True if the effective capability set is empty (post-drop measurement).
+fn cap_eff_is_zero() -> Result<bool> {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let header = CapHeader {
+        version: 0x20080522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let mut data = [
+        CapData { effective: 0, permitted: 0, inheritable: 0 },
+        CapData { effective: 0, permitted: 0, inheritable: 0 },
+    ];
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &header as *const _,
+            data.as_mut_ptr() as *mut _,
+        )
+    };
+    if rc != 0 {
+        bail!("capget failed");
+    }
+    Ok(data.iter().all(|d| d.effective == 0))
 }
