@@ -15,8 +15,8 @@ GOVERNOR allocates task → EXCHANGE routes to lane → ORGANELLE HOST runs it
 │ OUTER (kernel): user/mount/PID/net namespaces,  │
 │   seccomp deny-by-default, zero caps, rlimits,  │
 │   watchdog                                      │
-│ INNER (LiteBox): syscall rewriting, virtual FS, │
-│   shim telemetry                                │
+│ INNER (LiteBox): syscall rewriting, virtual FS  │
+│   (no telemetry API — fields null/unavailable) │
 │                                                 │
 │ EMITS: receipt.json (PL-style)                  │
 └─────────────────────────────────────────────────┘
@@ -34,10 +34,12 @@ PROOF LEDGER ← receipt (claims, syscalls, files, artifact hash)
 
 **Output (`receipt.json`):**
 - `outer_sandbox` — namespaces, seccomp, caps, rlimits actually applied
-- `syscalls_allowed` / `syscalls_denied` — from shim telemetry
+- `syscalls_allowed` / `syscalls_denied` — null (shim exposes no telemetry API;
+  receipt marks `telemetry_status: unavailable`, never zero-as-unknown)
 - `files_read` / `files_written`
 - `exit_status`, `resource_usage` (wait4 rusage)
-- `artifact_hash` — sha256 of stdout
+- `artifact_hash` — sha256 of the retained stdout prefix (16MiB budget;
+  truncation recorded honestly with byte counts when the guest floods)
 - `policy_hash`, `tar_hash`
 - `caveats` — honest unknowns
 
@@ -58,11 +60,15 @@ The host is a **lane type** in the exchange registry, not a special case:
 - [ ] Exchange lane adapter: register `organelle-host` lane kind
 - [ ] Governor policy: route sandboxed tasks → host lanes
 - [ ] End-to-end: governor → exchange → host → PL receipt → CANON
-- [ ] Hostile tests (blocked: safety system refused probe compile)
+- [x] Hostile tests (tests/hostile/a-i + tests/evidence/run-hostile.sh;
+  full-stack runs 2026-10-10, see docs/10-10-SECURITY.md §3)
 
 ## Honest boundaries
 
-- Cooperative guests: PROVEN. Malicious guests: UNKNOWN (no live bypass observed killed).
+- Cooperative guests: PROVEN. Hostile probes (a-i) run against the full stack:
+  fork bombs, thread floods, FD leaks, output floods, root writes all
+  contained or fail-closed (docs/10-10-SECURITY.md §3). Adaptive adversary:
+  still UNKNOWN by design — probes test specific invariants, not all attacks.
 - The seccomp filter is correctly constructed (isolated filter test) but the
   raw-syscall bypass was never executed against the full stack.
 - No claims about kernel exploits, side channels, or container escapes.

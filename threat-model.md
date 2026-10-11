@@ -77,18 +77,22 @@ theory, but fds available to the guest are limited to stdio/pipes/telemetry.
 **Was:** The LiteBox runner ran with full host visibility.
 **Mitigation:** User + mount + PID + net namespaces; pivot_root to an empty root
 with only allowlist bind-mounts (RO) and a tmpfs /tmp; all capabilities dropped;
-setuid(nobody). Landlock: **not mitigated** — the kernel does not expose it
-(/sys/kernel/security absent); documented in every receipt.
+setuid(nobody). Landlock: **conditional** — measured per-run via
+/sys/kernel/security probe; enforced only where the kernel exposes it, and the
+receipt states the measured result honestly (the old hard-coded "kernel does not
+expose it" was wrong on kernels that do; fixed 2026-10-10, commit 0628b2d).
 **Proven by:** hostile tests (a) /proc/self/mem → ENOENT, (d) write outside
 allowlist → ENOENT/EROFS.
 
 ### R4 — Network all-or-nothing via TUN
 **Was:** Network allow/deny was a single TUN toggle.
 **Mitigation:** Two independent denials: (1) LiteBox platform created with
-`tun_device_name=None` (no backend); (2) the child is in a net namespace with
-**zero interfaces** (not even loopback). A guest socket() via the shim has no
-backend; a raw host socket() is killed by seccomp; even if both failed, no
-interface exists to route packets.
+`tun_device_name=None` (no backend); (2) the child is in a net namespace whose
+interface list is measured per-run (observed: `lo` only — the old "zero
+interfaces, not even loopback" slogan was false; fixed 2026-10-10, commit
+0628b2d). A guest socket() via the shim has no backend; a raw host socket()
+is killed by seccomp; the measured interface list is in the receipt, not a
+slogan.
 **Proven by:** hostile test (c) — shim socket() with no TUN → watchdog timeout;
 raw socket() → SIGSYS.
 
@@ -105,7 +109,9 @@ not a wedged host.
 
 ## 4. Explicitly NOT mitigated (honest)
 
-- **Landlock:** kernel doesn't expose it here. Not enforced.
+- **Landlock:** conditional — measured per-run via /sys/kernel/security probe
+  (observed available on this kernel 2026-10-10). Enforced only where exposed;
+  the receipt states the measured result. Not a universal guarantee.
 - **cgroups v2:** not writable in this environment. RLIMIT_AS + RLIMIT_CPU used.
   (RLIMIT_AS caps virtual address space, which is the practical OOM lever for a
   single process; it does not account page cache or provide the observability
@@ -122,8 +128,12 @@ not a wedged host.
 - **Malicious guests.** The pilot is **cooperative-guest only**. The hostile tests
   demonstrate that *specific* escape attempts fail; they do not prove containment
   of an adaptive adversary. Do not extrapolate.
-- **Resource exhaustion of the host** beyond the child's rlimits (fork bombs are
-  contained by the PID ns + nproc implicit limits, but this is not stress-tested).
+- **Resource exhaustion of the host** beyond the child's rlimits: fork bombs
+  contained — default-deny kills clone at the outer filter (hostile test g:
+  all 3000 fork attempts denied, clean exit); with allow_clone=true the
+  guest is SIGSYS-killed at ~5-16 threads, well before RLIMIT_NPROC=64
+  (hostile test g2, 2026-10-10 closeout). Fail-closed in both modes; exact
+  SIGSYS syscall unattributed (residual).
 - **Covert channels** via timing, exit codes, or resource usage.
 - **Supply chain:** the guest tar is built from host files; a compromised host
   binary compromises the guest. The tar_hash in the receipt identifies *what ran*,
