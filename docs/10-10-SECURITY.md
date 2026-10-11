@@ -68,6 +68,39 @@ Evidence: `tests/hostile/` (probes a–i, rebuilt from source 2026-10-10), `test
 5. **Upstream LiteBox 0.1 is research-grade.** Proof boundary 4/10 per Oct-10 review. The wrapper treats it as untrusted; any upstream soundness bug is a wrapper-visible incident, not a wrapper-preventable one.
 6. **No independent re-audit yet.** Everything above is builder-tested (closeout audit by a second agent, 2026-10-10). An independent party has not re-run the hostile matrix.
 
+### 2026-10-10 Phase 2 host fix (allowlist EPERM) — residuals added
+
+7. **Upstream LiteBox has no /proc/self/exe (KNOWN, OUT OF SCOPE).** After the
+   host fix, hayabusa loads and executes as a guest but panics at
+   `src/detections/configs.rs:36` (`current_exe().unwrap()`: "no /proc/self/exe
+   available"). LiteBox's virtual FS has no /proc backend, TarRo skips
+   symlinks, `InitialNode` has no symlink variant, and the `Backend` trait is
+   `Sealed` (not implementable outside the litebox crate) — so no host-side
+   synthesis is possible without forking upstream. Any guest that calls
+   `current_exe()` (or otherwise needs /proc) cannot run until upstream gains
+   a /proc personality. Tracked separately against upstream Microsoft LiteBox,
+   like residual #2.
+8. **Guest-allocator compat shims in guest env (DONE, documented).**
+   `MIMALLOC_ALLOW_THP=0` + `MIMALLOC_LARGE_OS_PAGES=0` are set in the minimal
+   guest env: mimalloc (hayabusa's allocator, `MI_DEFAULT_ALLOW_THP=1` on
+   Linux) issues `madvise(MADV_HUGEPAGE)`, which the LiteBox platform's memory
+   manager does not implement (`mm.rs:920` `unimplemented!` → platform panic
+   → SIGSYS). The hint is advisory (the kernel may ignore it too), so
+   disabling it changes no containment property. The correct upstream fix is
+   for `sys_madvise` to no-op advisory hints instead of panicking; filed
+   alongside residual #7.
+9. **Tar format is USTAR, not GNU (FIXED this change).** `build_guest_tar`
+   used `Header::new_gnu()`; the guest's tar parser (`tar_no_std`, upstream)
+   does not understand GNU 'L' (longname) entries — worse, its entry iterator
+   silently *terminates* at the first 'L' entry, dropping every later entry
+   from the guest FS index. Any allowlist path >100 chars (e.g. hayabusa's
+   `rules/config/data_mapping/*.yaml`) made the loader/interp libs vanish →
+   `load_program failed: ENOENT`. Now: `Header::new_ustar()` (prefix-splitting,
+   understood by `tar_no_std`) + an explicit fail-closed guard refusing guest
+   paths >255 bytes. Pinned by the `guest_reads_allowlisted_file_end_to_end`
+   regression test shape (non-empty allowlist — the exact hole Phase 1
+   missed).
+
 ---
 
 ## 5. Milestones to 10/10 (each with acceptance tests)

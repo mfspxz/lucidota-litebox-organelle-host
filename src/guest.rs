@@ -74,9 +74,19 @@ fn run_guest_inner(config: &SandboxConfig, tar_data: &'static [u8]) -> Result<i3
         .map(|a| CString::new(a.as_bytes()).unwrap())
         .collect();
     // Minimal environment: do not leak host env into the guest.
+    // MIMALLOC_ALLOW_THP=0 / MIMALLOC_LARGE_OS_PAGES=0: guest-compat shims
+    // (documented, not a security boundary). Some guests (e.g. hayabusa via
+    // mimalloc, which defaults MI_DEFAULT_ALLOW_THP=1 on Linux) issue
+    // madvise(MADV_HUGEPAGE); the LiteBox platform's memory manager does not
+    // implement that advisory hint and panics (upstream gap, filed as a
+    // residual). Disabling THP/large-pages in the allocator avoids the
+    // unimplemented path; it changes no containment property (the hint is
+    // advisory — the kernel may ignore it too).
     let envp: Vec<CString> = vec![
         CString::new("PATH=/bin:/usr/bin").unwrap(),
         CString::new("HOME=/tmp").unwrap(),
+        CString::new("MIMALLOC_ALLOW_THP=0").unwrap(),
+        CString::new("MIMALLOC_LARGE_OS_PAGES=0").unwrap(),
     ];
 
     // Inner seccomp (LiteBox platform's own filter). Stacks with the outer

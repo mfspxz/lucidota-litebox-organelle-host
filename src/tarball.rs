@@ -226,10 +226,25 @@ pub fn build_guest_tar(
     }
 
     // 3. Allowlist entries (files; directories are walked).
+    //
+    // The tar is the SOLE file-ingress path into the guest (no bind mounts;
+    // see sandbox.rs setup_mounts NOTE). Symlink entries are REFUSED, fail
+    // closed: following them would silently widen the guest-visible set
+    // beyond the literal allowlist entry (a symlink to a directory would
+    // tar the entire target tree). Directory walks already skip symlinks
+    // (walkdir_simple only descends real dirs / copies real files).
     for entry in allowlist {
         let p = Path::new(entry);
         if p == prog_path {
             continue; // already added (rewritten)
+        }
+        let link_meta = std::fs::symlink_metadata(p)
+            .with_context(|| format!("stat allowlist {}", p.display()))?;
+        if link_meta.file_type().is_symlink() {
+            bail!(
+                "allowlist entry is a symlink (refused, fail closed): {}",
+                p.display()
+            );
         }
         let meta = std::fs::metadata(p)
             .with_context(|| format!("stat allowlist {}", p.display()))?;
@@ -250,13 +265,29 @@ pub fn build_guest_tar(
         bail!("no files collected for guest tar");
     }
 
-    // 4. Write the tar (deterministic order for a stable hash).
+    // 4. Write the tar.
+    //
+    // USTAR format (not GNU): the LiteBox guest's tar parser (tar_no_std)
+    // does NOT understand GNU 'L' (longname) entries — worse, its entry
+    // iterator silently TERMINATES at the first 'L' entry, dropping every
+    // later entry from the guest's filesystem index (observed: a >100-char
+    // allowlist path caused the loader/libs to vanish -> ENOENT). USTAR
+    // prefix-splitting (up to 255 bytes total) is understood by tar_no_std.
+    // Paths that fit neither fail closed here via the explicit length guard.
+    for e in &entries {
+        if e.guest_path.len() > 255 {
+            bail!(
+                "guest path exceeds ustar maximum (255 bytes), refused: {}",
+                e.guest_path
+            );
+        }
+    }
     entries.sort_by(|a, b| a.guest_path.cmp(&b.guest_path));
     let mut tar_data = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_data);
         for e in &entries {
-            let mut header = tar::Header::new_gnu();
+            let mut header = tar::Header::new_ustar();
             header.set_size(e.data.len() as u64);
             header.set_mode(e.mode);
             // Guest identity: root-owned system files, readable by all.

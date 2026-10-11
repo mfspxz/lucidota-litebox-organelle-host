@@ -10,7 +10,7 @@ use nix::sched::{CloneFlags, clone};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::os::fd::RawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::manifest::Manifest;
@@ -457,7 +457,24 @@ fn child_entry(config: &SandboxConfig) -> Result<i32> {
     crate::guest::run_guest(config, tar_static)
 }
 
-/// Make all mounts private, build an empty root with only allowlist binds.
+/// Make all mounts private and build an empty root (tmpfs /tmp only).
+///
+/// NOTE (2026-10-10, Phase 2 host fix): the allowlist is NO LONGER
+/// bind-mounted here. The child runs in a user namespace mapped to
+/// host nobody (65534); the bind remount-ro
+/// (`MS_REMOUNT|MS_BIND|MS_RDONLY`) requires CAP_SYS_ADMIN in the user
+/// namespace owning the source superblock (the initial/host userns), which
+/// the child does not hold — the kernel refuses with EPERM, so every
+/// non-empty allowlist died as child_setup_failed(127). The binds were
+/// redundant anyway: the guest's filesystem is the LiteBox virtual FS, an
+/// overlay of the in-mem layer over the READ-ONLY tar layer
+/// (`TarRo`, see guest.rs `default_fs`) — the host mount namespace is never
+/// consulted by guest syscalls. `build_guest_tar` already packs every
+/// allowlist file (world-readable, write bits cleared) into `guest.tar`,
+/// so the tar channel is the SOLE file-ingress path, with equivalent
+/// read-only properties and a strictly smaller host-visible set than the
+/// old binds (binds also exposed allowlist paths to raw-syscall bypasses;
+/// the empty root exposes nothing).
 fn setup_mounts(config: &SandboxConfig) -> Result<()> {
     use std::ffi::CString;
 
@@ -479,58 +496,8 @@ fn setup_mounts(config: &SandboxConfig) -> Result<()> {
         bail!("make-rprivate failed");
     }
 
-    // Helper to bind-mount.
-    let bind = |src: &Path, dst: &Path, readonly: bool| -> Result<()> {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // For files, the destination must exist as a file.
-        let src_meta = std::fs::metadata(src)?;
-        if src_meta.is_file() {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(dst)?;
-        } else {
-            std::fs::create_dir_all(dst)?;
-        }
-        let src_c = CString::new(src.to_string_lossy().as_bytes())?;
-        let dst_c = CString::new(dst.to_string_lossy().as_bytes())?;
-        let rc = unsafe {
-            libc::mount(
-                src_c.as_ptr(),
-                dst_c.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            )
-        };
-        if rc != 0 {
-            bail!("bind mount {} -> {}", src.display(), dst.display());
-        }
-        if readonly {
-            let rc = unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    dst_c.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                    std::ptr::null(),
-                )
-            };
-            if rc != 0 {
-                bail!("remount ro {}", dst.display());
-            }
-        }
-        Ok(())
-    };
-
-    // Bind the allowlist (read-only) into the new root at the same paths.
-    for entry in &config.manifest.filesystem_allowlist {
-        let src = Path::new(entry);
-        let dst = root.join(entry.trim_start_matches('/'));
-        bind(src, &dst, true)?;
-    }
+    // Allowlist files reach the guest exclusively via guest.tar (read-only
+    // TarRo layer). No bind mounts: see NOTE above.
 
     // tmpfs on /tmp (writable scratch).
     let tmp_dst = root.join("tmp");

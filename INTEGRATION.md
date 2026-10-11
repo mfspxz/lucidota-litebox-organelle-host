@@ -30,7 +30,7 @@ PROOF LEDGER ← receipt (claims, syscalls, files, artifact hash)
 **Input:**
 - `bundle.tar` — the organelle: code + manifest. Hashed (tar_hash in receipt).
 - `manifest.json` — `{organelle_id, entrypoint, args, policy_hash, resource_limits}`
-- `policy.json` — allowlisted bind mounts, syscall policy, timeout.
+- `policy.json` — allowlist (delivered read-only via the guest tar), syscall policy, timeout.
 
 **Output (`receipt.json`):**
 - `outer_sandbox` — namespaces, seccomp, caps, rlimits actually applied

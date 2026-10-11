@@ -50,7 +50,9 @@ pub struct Manifest {
     /// argv[0] must be an absolute guest path (e.g. "/bin/echo").
     pub command: Vec<String>,
     /// Host paths to make visible inside the sandbox (read-only), plus the
-    /// program's own ELF dependencies (resolved automatically).
+    /// program's own ELF dependencies (resolved automatically). Delivered
+    /// exclusively via the read-only guest tar (TarRo layer); symlink
+    /// entries are refused, fail closed.
     pub filesystem_allowlist: Vec<String>,
     /// Pilot only supports "deny".
     pub network: String,

@@ -9,7 +9,8 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ OUTER SANDBOX (kernel-enforced, this binary)                │
 │  • user ns (0 → 65534/nobody)                               │
-│  • mount ns (empty root; allowlist bind-mounts RO; /tmp)    │
+│  • mount ns (empty root; NO bind mounts — allowlist via read-only   │
+│    guest tar; /tmp)                                             │
 │  • pid ns (child is PID 1)                                  │
 │  • net ns (zero interfaces)                                 │
 │  • seccomp-BPF deny-by-default → KILL_PROCESS               │
@@ -32,7 +33,7 @@
 | Mechanism | Trusts | Enforces |
 |---|---|---|
 | User namespace | Kernel userns isolation | Child is nobody(65534) on host; no host privilege |
-| Mount namespace | Kernel mount isolation | Child sees empty root + RO allowlist + /tmp; no /proc, /sys, /dev |
+| Mount namespace | Kernel mount isolation | Child sees empty root + tmpfs /tmp only; no /proc, /sys, /dev. Allowlist files are NOT bind-mounted (the nobody-mapped child gets EPERM on the bind remount-ro); they reach the guest exclusively via the read-only guest tar (TarRo layer). |
 | PID namespace | Kernel pid isolation | Child cannot see/signal host processes |
 | Net namespace | Kernel net isolation | Zero interfaces → no packets can leave/enter |
 | seccomp-BPF (deny→kill) | Kernel seccomp | Only allowlisted host syscalls; everything else kills the process. **Cannot be bypassed by JIT'd syscalls** — the filter sees the real syscall. |
@@ -76,7 +77,9 @@ theory, but fds available to the guest are limited to stdio/pipes/telemetry.
 ### R3 — No namespaces, no chroot, no Landlock, no capability dropping
 **Was:** The LiteBox runner ran with full host visibility.
 **Mitigation:** User + mount + PID + net namespaces; pivot_root to an empty root
-with only allowlist bind-mounts (RO) and a tmpfs /tmp; all capabilities dropped;
+with a tmpfs /tmp (no bind mounts — the allowlist travels exclusively via the
+read-only guest tar, since the nobody-mapped child cannot bind-mount read-only:
+EPERM on the remount, fixed 2026-10-10); all capabilities dropped;
 setuid(nobody). Landlock: **conditional** — measured per-run via
 /sys/kernel/security probe; enforced only where the kernel exposes it, and the
 receipt states the measured result honestly (the old hard-coded "kernel does not
