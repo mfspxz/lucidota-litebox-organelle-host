@@ -4,7 +4,7 @@
 **Date:** 2026-10-10  
 **Repo:** litebox-organelle-host (~/workspace/litebox-organelle-host)  
 **Audited at:** Git HEAD 1c5fd1b  
-**Commit:** TBD (doc-only; changed files: threat-model.md, this file; src/sandbox.rs left alone)
+**This pass:** `9331177` (doc-only; code left to the hardening coordinator)
 
 ## Deconfliction
 
@@ -57,7 +57,7 @@ No unsourced oral footnotes found in my read.
 ## Commits
 
 - Changed files: `threat-model.md`, this file (`AUDIT-APPLICATION.md`)
-- Commit hash: TBD
+- Commit hash: `9331177`
 - `src/sandbox.rs` intentionally untouched (coordinator mid-edit)
 
 ## Test results
