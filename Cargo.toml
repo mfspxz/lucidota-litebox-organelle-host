@@ -28,6 +28,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tar = "0.4"
+# Manifest authentication (P1): Ed25519 signatures over the canonical
+# manifest. Industry-standard primitive; no hand-rolled crypto.
+ed25519-dalek = "3"
 
 # Organelle migration (wave 4b-1): native Tier A registration surface
 organelle-host = { path = "../organelles/crates/organelle-host" }

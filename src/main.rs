@@ -31,11 +31,43 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 || args[1] != "run" || args[2] != "--manifest" {
-        bail!("usage: {} run --manifest <manifest.json>", args[0]);
+    // Usage: run --manifest <manifest.json> [--trusted-key <hex-ed25519-pub>]
+    if args.len() < 4 || args.len() > 6 || args[1] != "run" || args[2] != "--manifest" {
+        bail!(
+            "usage: {} run --manifest <manifest.json> [--trusted-key <hex>]",
+            args[0]
+        );
+    }
+    let mut trusted_key: Option<&str> = None;
+    if args.len() == 6 {
+        if args[4] != "--trusted-key" {
+            bail!(
+                "usage: {} run --manifest <manifest.json> [--trusted-key <hex>]",
+                args[0]
+            );
+        }
+        trusted_key = Some(&args[5]);
     }
     let manifest_json = std::fs::read_to_string(&args[3]).context("read manifest")?;
     let manifest = Manifest::parse(&manifest_json)?;
+
+    // Authenticate BEFORE doing anything with the manifest's contents.
+    // Strict mode (--trusted-key): ungrants are rejected here, fail closed.
+    let auth_outcome = manifest.authenticate(trusted_key)?;
+    if auth_outcome.status == manifest::AuthStatus::UnverifiedLocal {
+        eprintln!("warning: no --trusted-key; running in UNVERIFIED local mode");
+    }
+
+    // Bind the exact program bytes to the grant: if the signed manifest
+    // names a program hash, the file must match before we package it.
+    if let Some(expected) = &manifest.program_sha256 {
+        let prog_bytes =
+            std::fs::read(&manifest.command[0]).context("read program for hash check")?;
+        let actual = hex(&Sha256::digest(&prog_bytes));
+        if &actual != expected {
+            bail!("program_sha256 mismatch: manifest names {expected}, file is {actual}");
+        }
+    }
 
     // Canonical policy hash (what the governor authorized).
     let policy_hash = hex(&Sha256::digest(manifest.canonical_json()?.as_bytes()));
@@ -135,6 +167,11 @@ fn real_main() -> Result<()> {
     if let Some(e) = setup_error {
         caveats.push(format!("child setup error: {}", e.trim()));
     }
+    if auth_outcome.status == manifest::AuthStatus::UnverifiedLocal {
+        caveats.push(
+            "manifest NOT signature-verified (no --trusted-key): the authority string is a caller claim, not a grant".to_string(),
+        );
+    }
     if !stderr.is_empty() {
         caveats.push(format!(
             "guest stderr ({} bytes observed, {} retained) not in artifact_hash; see logs",
@@ -156,7 +193,12 @@ fn real_main() -> Result<()> {
 
     let receipt = Receipt {
         organelle_id: manifest.organelle_id.clone(),
-        authority: manifest.authority.clone(),
+        authority: auth_outcome.receipt_authority.clone(),
+        auth_status: match auth_outcome.status {
+            manifest::AuthStatus::Verified => "verified".to_string(),
+            manifest::AuthStatus::UnverifiedLocal => "unverified-local".to_string(),
+        },
+        invocation_id: auth_outcome.invocation_id.clone(),
         sandbox: "litebox".to_string(),
         platform: "linux_userland".to_string(),
         outer_sandbox: sandbox::describe(),
@@ -189,9 +231,10 @@ fn real_main() -> Result<()> {
     println!("{}", receipt.to_json());
     eprintln!("receipt digest: {}", receipt.digest());
 
-    // Best-effort cleanup (keep the workdir on failure for forensics).
+    // Best-effort cleanup (keep the workdir on failure, or whenever the
+    // manifest asks for forensics).
     let failed = result.timed_out || result.exit_code != Some(0);
-    if !failed {
+    if !failed && !manifest.keep_workdir {
         let _ = std::fs::remove_dir_all(&workdir);
     } else {
         eprintln!("workdir kept for forensics: {}", workdir.display());

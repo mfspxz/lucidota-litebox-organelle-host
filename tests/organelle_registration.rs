@@ -51,10 +51,10 @@ fn describe_runs_live_through_host() {
     let out = host.call(&ctx, "lh", "describe", json!({})).expect("describe");
     // The real sandbox::describe() output: measured booleans, not assumed.
     assert_eq!(
-        out.get("capabilities_dropped").and_then(|v| v.as_bool()),
+        out.output.get("capabilities_dropped").and_then(|v| v.as_bool()),
         Some(true)
     );
-    assert!(out.get("seccomp").and_then(|v| v.as_str()).is_some());
+    assert!(out.output.get("seccomp").and_then(|v| v.as_str()).is_some());
     host.verify_chain().expect("chain verifies after invocation");
 }
 

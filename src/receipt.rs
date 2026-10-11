@@ -33,6 +33,11 @@ pub struct ResourceUsage {
 pub struct Receipt {
     pub organelle_id: String,
     pub authority: String,
+    /// "verified" (signature checked against --trusted-key) or
+    /// "unverified-local" (no key; authority is a caller claim).
+    pub auth_status: String,
+    /// Grant's invocation id (replay binding), or "none".
+    pub invocation_id: String,
     pub sandbox: String,   // "litebox"
     pub platform: String,  // "linux_userland"
     pub outer_sandbox: OuterSandbox,
