@@ -141,3 +141,21 @@ not a wedged host.
 | (e) memory exhaustion | RLIMIT_AS caps the child's address space; the OOM is contained. |
 
 Each test's receipt records the denial. **Claim only what the tests prove.**
+
+### Rigor application (2026-10-10, brutal-audit rollout R-1/R-7/R-8)
+
+- **R-1 (instance-only):** every "Proven by hostile test (x)" claim above is
+  `class_scope: instance-only`. Each hostile test proves one specific attack
+  shape fails; none proves containment of an adaptive adversary (see §5:
+  "Malicious guests" is out of scope — do not extrapolate).
+- **R-7:** the hostile tests are PROPERTY tests for their stated invariant
+  ("a JIT'd syscall for a non-allowlisted call is killed by the kernel"),
+  run manually against the built binary. They are NOT wired into `cargo test`
+  (0 `#[test]` in this repo). Their record is this document's table, not a CI
+  gate — read §6 as the test log.
+- **R-8 (honestly-unsigned):** `receipt.json` is an observation log, not a
+  signed artifact. It carries hashes (artifact_hash, policy_hash, tar_hash)
+  and a `caveats[]` field for what was NOT proven. Its verification power is
+  "the operator can re-check the hashes", not provenance. Do not present a
+  receipt as proof of guest benignity — per §5, tar_hash identifies what ran,
+  not that it was benign.
